@@ -34,12 +34,23 @@ import (
 	"google.golang.org/api/iterator"
 
 	"cloud.google.com/go/storage"
+	"io" // Required for io.WriteCloser and io.ReadCloser
 	gomemcache "github.com/bradfitz/gomemcache/memcache"
 	"google.golang.org/appengine/memcache"
 
 	//opensearch "github.com/shuffle/opensearch-go"
 	opensearch "github.com/opensearch-project/opensearch-go"
 	"github.com/opensearch-project/opensearch-go/v2/opensearchapi"
+)
+
+// For GCS operation mocking in tests
+var (
+	newGCSWriterFunc func(ctx context.Context, o *storage.ObjectHandle) io.WriteCloser = func(ctx context.Context, o *storage.ObjectHandle) io.WriteCloser {
+		return o.NewWriter(ctx)
+	}
+	newGCSReaderFunc func(ctx context.Context, o *storage.ObjectHandle) (io.ReadCloser, error) = func(ctx context.Context, o *storage.ObjectHandle) (io.ReadCloser, error) {
+		return o.NewReader(ctx)
+	}
 )
 
 var requestCache = cache.New(60*time.Minute, 60*time.Minute)
@@ -1052,7 +1063,7 @@ func getExecutionFileValue(ctx context.Context, workflowExecution WorkflowExecut
 
 	bucket := project.StorageClient.Bucket(bucketName)
 	obj := bucket.Object(fullParsedPath)
-	fileReader, err := obj.NewReader(ctx)
+	fileReader, err := newGCSReaderFunc(ctx, obj) // Use factory
 	if err != nil {
 		log.Printf("[ERROR] Failed reading file '%s' from bucket %s: %s. Will try with alternative solution.", fullParsedPath, bucketName, err)
 
@@ -1060,7 +1071,7 @@ func getExecutionFileValue(ctx context.Context, workflowExecution WorkflowExecut
 			bucketName = fmt.Sprintf("%s.appspot.com", projectName)
 			bucket = project.StorageClient.Bucket(bucketName)
 			obj = bucket.Object(fullParsedPath)
-			fileReader, err = obj.NewReader(ctx)
+			fileReader, err = newGCSReaderFunc(ctx, obj) // Use factory
 			if err != nil {
 				log.Printf("[ERROR] Failed reading file '%s' again from bucket %s: %s", fullParsedPath, bucketName, err)
 				return "", err
@@ -12471,26 +12482,72 @@ func SetDatastoreKey(ctx context.Context, cacheData CacheKeyData) error {
 	}
 
 	// New struct, to not add body, author etc
-	data, err := json.Marshal(cacheData)
-	if err != nil {
-		log.Printf("[ERROR] Failed marshalling in set cache key: %s", err)
-		return nil
-	}
+	// Marshaling is done after potential modification for GCS path, or if OpenSearch is used.
+	var data []byte
+	var err error
 
 	if project.DbType == "opensearch" {
+		data, err = json.Marshal(cacheData)
+		if err != nil {
+			log.Printf("[ERROR] Failed marshalling CacheKeyData for OpenSearch in set cache key: %s", err)
+			return err
+		}
 		err = indexEs(ctx, nameKey, cacheId, data)
 		if err != nil {
+			// OpenSearch doesn't typically give "entity is too big" in the same way,
+			// but if it did, GCS logic could be triggered here too.
+			// For now, just returning the error from OpenSearch.
 			return err
 		}
 	} else {
+		// Datastore path
 		key := datastore.NameKey(nameKey, cacheId, nil)
-		if _, err := project.Dbclient.Put(ctx, key, &cacheData); err != nil {
-			log.Printf("[ERROR] Error setting org cache: %s", err)
-			return err
+		_, err = project.Dbclient.Put(ctx, key, &cacheData)
+		if err != nil {
+			if strings.Contains(err.Error(), "entity is too big") {
+				log.Printf("[INFO] Datastore Put failed for key %s (org %s) due to 'entity is too big'. Attempting GCS upload.", cacheData.Key, cacheData.OrgId)
+
+				gcsPath := fmt.Sprintf("large_cache_values/%s/%s", cacheData.OrgId, cacheData.Key)
+				bucket := project.StorageClient.Bucket(project.BucketName)
+				obj := bucket.Object(gcsPath)
+				writer := newGCSWriterFunc(ctx, obj) // Use factory
+				if _, writeErr := writer.Write([]byte(cacheData.Value)); writeErr != nil {
+					writer.Close() // Attempt to close even if write failed
+					log.Printf("[ERROR] Failed to write cache value to GCS for key %s (path %s): %s", cacheData.Key, gcsPath, writeErr)
+					return writeErr // Return GCS write error
+				}
+				if closeErr := writer.Close(); closeErr != nil {
+					log.Printf("[ERROR] Failed to close GCS writer for key %s (path %s): %s", cacheData.Key, gcsPath, closeErr)
+					return closeErr // Return GCS close error
+				}
+
+				log.Printf("[INFO] Successfully uploaded large cache value for key %s to GCS: %s", cacheData.Key, gcsPath)
+				originalValueSize := len(cacheData.Value)
+				cacheData.Value = fmt.Sprintf("GCS_VALUE:%s", gcsPath)
+
+				// Retry Datastore Put with the placeholder
+				log.Printf("[INFO] Retrying Datastore Put for key %s (org %s) with GCS placeholder. Original size: %d", cacheData.Key, cacheData.OrgId, originalValueSize)
+				if _, err = project.Dbclient.Put(ctx, key, &cacheData); err != nil {
+					log.Printf("[ERROR] Error setting org cache with GCS placeholder for key %s: %s", cacheId, err)
+					return err // Return error from second Put attempt
+				}
+				log.Printf("[INFO] Successfully saved GCS placeholder to Datastore for key %s", cacheId)
+			} else {
+				// Initial Put error was not "entity is too big"
+				log.Printf("[ERROR] Error setting org cache for key %s: %s", cacheId, err)
+				return err
+			}
 		}
 	}
 
-	if project.CacheDb {
+	// Marshal here for caching, after cacheData.Value might have been updated to placeholder
+	data, err = json.Marshal(cacheData)
+	if err != nil {
+		log.Printf("[ERROR] Failed marshalling CacheKeyData for cache update in set cache key: %s", err)
+		// Don't return error here, as primary storage succeeded.
+	}
+
+	if project.CacheDb && data != nil {
 		cacheKey := fmt.Sprintf("%s_%s", nameKey, cacheId)
 		err = SetCache(ctx, cacheKey, data, 30)
 		if err != nil {
@@ -12689,6 +12746,31 @@ func GetDatastoreKey(ctx context.Context, id string, category string) (*CacheKey
 			}
 		} else {
 			cacheData.FormattedKey = id
+
+			// Check if the value is a GCS placeholder
+			if strings.HasPrefix(cacheData.Value, "GCS_VALUE:") {
+				gcsPath := strings.TrimPrefix(cacheData.Value, "GCS_VALUE:")
+				log.Printf("[INFO] CacheKeyData %s has GCS placeholder: %s. Attempting to download from GCS.", cacheData.Key, gcsPath)
+
+				bucket := project.StorageClient.Bucket(project.BucketName)
+				obj := bucket.Object(gcsPath)
+				rc, err := newGCSReaderFunc(ctx, obj) // Use factory
+				if err != nil {
+					log.Printf("[ERROR] Failed to create GCS reader for key %s (path %s): %s", cacheData.Key, gcsPath, err)
+					// Decide if we should return error or the placeholder value
+					// For now, let's return the placeholder and log error, as primary storage (datastore) succeeded.
+				} else {
+					defer rc.Close()
+					gcsValueBytes, err := ioutil.ReadAll(rc)
+					if err != nil {
+						log.Printf("[ERROR] Failed to read GCS object for key %s (path %s): %s", cacheData.Key, gcsPath, err)
+						// Same as above, return placeholder on error
+					} else {
+						log.Printf("[INFO] Successfully downloaded value from GCS for key %s. Size: %d", cacheData.Key, len(gcsValueBytes))
+						cacheData.Value = string(gcsValueBytes)
+					}
+				}
+			}
 		}
 	}
 
