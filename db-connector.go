@@ -12471,6 +12471,28 @@ func SetDatastoreKey(ctx context.Context, cacheData CacheKeyData) error {
 	}
 
 	// New struct, to not add body, author etc
+	if len(cacheData.Value) > maxCacheSize {
+		gcsPath := fmt.Sprintf("large_cache_values/%s/%s", cacheData.OrgId, cacheData.Key)
+		log.Printf("[INFO] Value for cache key %s (org %s) is too large (%d bytes), uploading to GCS path %s", cacheData.Key, cacheData.OrgId, len(cacheData.Value), gcsPath)
+
+		// Upload to GCS
+		bucket := project.StorageClient.Bucket(project.BucketName)
+		obj := bucket.Object(gcsPath)
+		writer := obj.NewWriter(ctx)
+		if _, err := writer.Write([]byte(cacheData.Value)); err != nil {
+			writer.Close()
+			log.Printf("[ERROR] Failed to write cache value to GCS for key %s: %s", cacheData.Key, err)
+			return err
+		}
+		if err := writer.Close(); err != nil {
+			log.Printf("[ERROR] Failed to close GCS writer for key %s: %s", cacheData.Key, err)
+			return err
+		}
+
+		log.Printf("[INFO] Successfully uploaded large cache value for key %s to GCS: %s", cacheData.Key, gcsPath)
+		cacheData.Value = fmt.Sprintf("GCS_VALUE:%s", gcsPath)
+	}
+
 	data, err := json.Marshal(cacheData)
 	if err != nil {
 		log.Printf("[ERROR] Failed marshalling in set cache key: %s", err)
@@ -12698,6 +12720,31 @@ func GetDatastoreKey(ctx context.Context, id string, category string) (*CacheKey
 	if len(cacheData.Key) > 0 {
 		if debug {
 			log.Printf("[DEBUG] Found key '%s' in datastore with org '%s' and category '%s'", cacheData.Key, cacheData.OrgId, cacheData.Category)
+		}
+	}
+
+	// Check for GCS_VALUE prefix and retrieve if necessary
+	if strings.HasPrefix(cacheData.Value, "GCS_VALUE:") {
+		gcsPath := strings.TrimPrefix(cacheData.Value, "GCS_VALUE:")
+		log.Printf("[INFO] Cache key %s (org %s) value is stored in GCS: %s. Downloading.", cacheData.Key, cacheData.OrgId, gcsPath)
+
+		bucket := project.StorageClient.Bucket(project.BucketName)
+		obj := bucket.Object(gcsPath)
+		reader, err := obj.NewReader(ctx)
+		if err != nil {
+			log.Printf("[ERROR] Failed to create GCS reader for key %s (path %s): %s", cacheData.Key, gcsPath, err)
+			// Depending on desired behavior, might return error or the placeholder value
+			// For now, return the placeholder and log error, as the primary record was found.
+		} else {
+			defer reader.Close()
+			gcsValueBytes, err := ioutil.ReadAll(reader)
+			if err != nil {
+				log.Printf("[ERROR] Failed to read value from GCS for key %s (path %s): %s", cacheData.Key, gcsPath, err)
+				// Same as above, return placeholder or error.
+			} else {
+				log.Printf("[INFO] Successfully downloaded value for key %s from GCS path %s", cacheData.Key, gcsPath)
+				cacheData.Value = string(gcsValueBytes)
+			}
 		}
 	}
 
