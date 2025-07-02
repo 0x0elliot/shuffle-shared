@@ -12774,9 +12774,7 @@ func GetDatastoreKey(ctx context.Context, id string, category string) (*CacheKey
 		}
 	}
 
-	// If value is a GCS placeholder, retrieve it from GCS
-	// This logic should only apply if nameKey is "org_cache"
-	if nameKey == "org_cache" && strings.HasPrefix(cacheData.Value, "GCS_VALUE:") {
+	if strings.HasPrefix(cacheData.Value, "GCS_VALUE:") {
 		gcsPath := strings.TrimPrefix(cacheData.Value, "GCS_VALUE:")
 		log.Printf("[INFO] GetDatastoreKey: Detected GCS placeholder for %s. Attempting to fetch from GCS path %s.", id, gcsPath)
 
