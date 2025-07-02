@@ -12506,14 +12506,15 @@ func SetDatastoreKey(ctx context.Context, cacheData CacheKeyData) error {
 					return fmt.Errorf("OrgId or Key missing for GCS path for %s", cacheId)
 				}
 
-				// Ensure GCSBucket is configured in the project
-				if project.GCSBucket == "" {
-					log.Printf("[ERROR] SetDatastoreKey: GCSBucket is not configured in project for OrgID %s.", cacheData.OrgId)
-					return fmt.Errorf("GCSBucket not configured for OrgID %s", cacheData.OrgId)
+				bucketName := project.BucketName
+
+				if bucketName == "" {
+					log.Printf("[ERROR] SetDatastoreKey: bucketName is not configured in project for OrgID %s.", cacheData.OrgId)
+					return fmt.Errorf("bucketName not configured for OrgID %s", cacheData.OrgId)
 				}
 
 				gcsPath := fmt.Sprintf("large_cache_values/%s/%s", cacheData.OrgId, cacheData.Key)
-				obj := project.StorageClient.Bucket(project.GCSBucket).Object(gcsPath)
+				obj := project.StorageClient.Bucket(bucketName).Object(gcsPath)
 				writer := obj.NewWriter(ctx)
 
 				originalValue := cacheData.Value // Keep original value to write to GCS
@@ -12563,7 +12564,8 @@ func SetDatastoreKey(ctx context.Context, cacheData CacheKeyData) error {
 			}
 		}
 		cacheKey := fmt.Sprintf("%s_%s", nameKey, cacheId)
-		err = SetCache(ctx, cacheKey, data, 30)
+		dataForCache, _ = json.Marshal(cacheData)
+		err := SetCache(ctx, cacheKey, dataForCache, 30)
 		if err != nil {
 			log.Printf("[ERROR] Failed setting cache for set cache key '%s': %s", cacheKey, err)
 		}
@@ -12778,8 +12780,10 @@ func GetDatastoreKey(ctx context.Context, id string, category string) (*CacheKey
 		gcsPath := strings.TrimPrefix(cacheData.Value, "GCS_VALUE:")
 		log.Printf("[INFO] GetDatastoreKey: Detected GCS placeholder for %s. Attempting to fetch from GCS path %s.", id, gcsPath)
 
+		bucketName := project.BucketName
+
 		// Ensure GCSBucket is configured
-		if project.GCSBucket == "" {
+		if bucketName == "" {
 			log.Printf("[ERROR] GetDatastoreKey: GCSBucket is not configured in project for OrgID %s. Returning placeholder.", cacheData.OrgId)
 			// Marshal current cacheData (with placeholder) for local cache before returning
 			if project.CacheDb {
@@ -12789,7 +12793,7 @@ func GetDatastoreKey(ctx context.Context, id string, category string) (*CacheKey
 			return cacheData, nil // Return placeholder as GCS cannot be accessed
 		}
 
-		obj := project.StorageClient.Bucket(project.GCSBucket).Object(gcsPath)
+		obj := project.StorageClient.Bucket(bucketName).Object(gcsPath)
 		reader, err := obj.NewReader(ctx)
 		if err != nil {
 			log.Printf("[ERROR] GetDatastoreKey: Failed to create GCS reader for %s: %s. Returning placeholder.", gcsPath, err)
