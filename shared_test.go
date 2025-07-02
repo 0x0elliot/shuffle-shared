@@ -31,8 +31,8 @@ func TestIsLoop(t *testing.T) {
 // Simple Test for HandleInternalProxy(client)
 // set env SHUFFLE_INTERNAL_HTTP_PROXY to test the function.
 func TestHandleInternalProxy(t *testing.T) {
-	client := &http.Client{}
-	result := HandleInternalProxy(client)
+	// client := &http.Client{} // Original client not needed for GetExternalClient
+	result := GetExternalClient("")
 
 	if result.Transport.(*http.Transport).Proxy != nil {
 		proxyURL, _ := result.Transport.(*http.Transport).Proxy(nil)
