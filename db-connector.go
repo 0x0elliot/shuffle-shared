@@ -12471,26 +12471,97 @@ func SetDatastoreKey(ctx context.Context, cacheData CacheKeyData) error {
 	}
 
 	// New struct, to not add body, author etc
-	data, err := json.Marshal(cacheData)
-	if err != nil {
-		log.Printf("[ERROR] Failed marshalling in set cache key: %s", err)
-		return nil
-	}
+	// data, err := json.Marshal(cacheData)
+	// if err != nil {
+	// 	log.Printf("[ERROR] Failed marshalling in set cache key: %s", err)
+	// 	return nil
+	// }
 
 	if project.DbType == "opensearch" {
+		// For OpenSearch, marshal and send data directly, no GCS offload for now.
+		data, err := json.Marshal(cacheData)
+		if err != nil {
+			log.Printf("[ERROR] Failed marshalling CacheKeyData for OpenSearch in SetDatastoreKey: %s", err)
+			return err
+		}
 		err = indexEs(ctx, nameKey, cacheId, data)
 		if err != nil {
+			log.Printf("[ERROR] Failed to index CacheKeyData to OpenSearch in SetDatastoreKey: %s", err)
 			return err
 		}
 	} else {
+		// Datastore path
 		key := datastore.NameKey(nameKey, cacheId, nil)
-		if _, err := project.Dbclient.Put(ctx, key, &cacheData); err != nil {
-			log.Printf("[ERROR] Error setting org cache: %s", err)
-			return err
+		_, err := project.Dbclient.Put(ctx, key, &cacheData)
+
+		if err != nil {
+			// Check if the error is "entity is too big" and nameKey is "org_cache"
+			// and DbType is not "opensearch" (already handled by the outer if-else)
+			if strings.Contains(err.Error(), "entity is too big") && nameKey == "org_cache" {
+				log.Printf("[INFO] SetDatastoreKey: Entity %s is too large for Datastore, attempting GCS offload.", cacheId)
+
+				// Ensure OrgId and Key are available for GCS path construction
+				if cacheData.OrgId == "" || cacheData.Key == "" {
+					log.Printf("[ERROR] SetDatastoreKey: OrgId or Key is missing for GCS path construction for cacheId %s.", cacheId)
+					return fmt.Errorf("OrgId or Key missing for GCS path for %s", cacheId)
+				}
+
+				// Ensure GCSBucket is configured in the project
+				if project.GCSBucket == "" {
+					log.Printf("[ERROR] SetDatastoreKey: GCSBucket is not configured in project for OrgID %s.", cacheData.OrgId)
+					return fmt.Errorf("GCSBucket not configured for OrgID %s", cacheData.OrgId)
+				}
+
+				gcsPath := fmt.Sprintf("large_cache_values/%s/%s", cacheData.OrgId, cacheData.Key)
+				obj := project.StorageClient.Bucket(project.GCSBucket).Object(gcsPath)
+				writer := obj.NewWriter(ctx)
+
+				originalValue := cacheData.Value // Keep original value to write to GCS
+				cacheData.Value = fmt.Sprintf("GCS_VALUE:%s", gcsPath) // Placeholder for Datastore
+
+				// Upload original value to GCS
+				if _, gcsWriteErr := writer.Write([]byte(originalValue)); gcsWriteErr != nil {
+					writer.Close() // Close writer on error
+					log.Printf("[ERROR] SetDatastoreKey: Failed to write value to GCS object %s: %s", gcsPath, gcsWriteErr)
+					// Attempt to restore original value if GCS fails, before returning error
+					cacheData.Value = originalValue
+					return fmt.Errorf("failed to write to GCS %s: %w", gcsPath, gcsWriteErr)
+				}
+				if closeErr := writer.Close(); closeErr != nil {
+					log.Printf("[ERROR] SetDatastoreKey: Failed to close GCS writer for object %s: %s", gcsPath, closeErr)
+					// Attempt to restore original value if GCS fails, before returning error
+					cacheData.Value = originalValue
+					return fmt.Errorf("failed to close GCS writer for %s: %w", gcsPath, closeErr)
+				}
+				log.Printf("[INFO] SetDatastoreKey: Successfully uploaded large value for %s to GCS path %s.", cacheId, gcsPath)
+
+				// Retry Datastore Put with placeholder
+				if _, putErr := project.Dbclient.Put(ctx, key, &cacheData); putErr != nil {
+					log.Printf("[ERROR] SetDatastoreKey: Failed to put placeholder for %s into Datastore after GCS upload: %s", cacheId, putErr)
+					// Value is already placeholder, GCS was successful. This is a datastore error.
+					return fmt.Errorf("failed to put placeholder for %s after GCS upload: %w", cacheId, putErr)
+				}
+				log.Printf("[INFO] SetDatastoreKey: Successfully stored GCS placeholder for %s in Datastore.", cacheId)
+			} else {
+				// Other Datastore Put error
+				log.Printf("[ERROR] SetDatastoreKey: Error setting org cache for %s: %s", cacheId, err)
+				return err
+			}
 		}
 	}
 
 	if project.CacheDb {
+		// Marshal the potentially modified cacheData (could be placeholder) for local cache
+		dataForCache, marshalErr := json.Marshal(cacheData)
+		if marshalErr != nil {
+			log.Printf("[ERROR] SetDatastoreKey: Failed marshalling CacheKeyData for local cache: %s", marshalErr)
+			// Continue without breaking, as primary storage was successful or handled.
+		} else {
+			setCacheErr := SetCache(ctx, fmt.Sprintf("%s_%s", nameKey, cacheId), dataForCache, 30)
+			if setCacheErr != nil {
+				log.Printf("[ERROR] SetDatastoreKey: Failed setting cache for set cache key '%s': %s", cacheId, setCacheErr)
+			}
+		}
 		cacheKey := fmt.Sprintf("%s_%s", nameKey, cacheId)
 		err = SetCache(ctx, cacheKey, data, 30)
 		if err != nil {
@@ -12701,16 +12772,51 @@ func GetDatastoreKey(ctx context.Context, id string, category string) (*CacheKey
 		}
 	}
 
-	if project.CacheDb {
-		data, err := json.Marshal(cacheData)
-		if err != nil {
-			log.Printf("[WARNING] Failed marshalling in getcachekey: %s", err)
-			return cacheData, nil
+	// If value is a GCS placeholder, retrieve it from GCS
+	// This logic should only apply if nameKey is "org_cache"
+	if nameKey == "org_cache" && strings.HasPrefix(cacheData.Value, "GCS_VALUE:") {
+		gcsPath := strings.TrimPrefix(cacheData.Value, "GCS_VALUE:")
+		log.Printf("[INFO] GetDatastoreKey: Detected GCS placeholder for %s. Attempting to fetch from GCS path %s.", id, gcsPath)
+
+		// Ensure GCSBucket is configured
+		if project.GCSBucket == "" {
+			log.Printf("[ERROR] GetDatastoreKey: GCSBucket is not configured in project for OrgID %s. Returning placeholder.", cacheData.OrgId)
+			// Marshal current cacheData (with placeholder) for local cache before returning
+			if project.CacheDb {
+				dataForCache, _ := json.Marshal(cacheData) // Ignoring error for brevity, but handle in real code
+				SetCache(ctx, cacheKey, dataForCache, 1440) // Use the already populated cacheKey
+			}
+			return cacheData, nil // Return placeholder as GCS cannot be accessed
 		}
 
-		err = SetCache(ctx, cacheKey, data, 1440)
+		obj := project.StorageClient.Bucket(project.GCSBucket).Object(gcsPath)
+		reader, err := obj.NewReader(ctx)
 		if err != nil {
-			log.Printf("[WARNING] Failed setting cache for get cache key: %s", err)
+			log.Printf("[ERROR] GetDatastoreKey: Failed to create GCS reader for %s: %s. Returning placeholder.", gcsPath, err)
+			// Return cacheData with placeholder, as per requirement
+		} else {
+			defer reader.Close()
+			gcsValueBytes, err := ioutil.ReadAll(reader)
+			if err != nil {
+				log.Printf("[ERROR] GetDatastoreKey: Failed to read value from GCS object %s: %s. Returning placeholder.", gcsPath, err)
+				// Return cacheData with placeholder
+			} else {
+				log.Printf("[INFO] GetDatastoreKey: Successfully retrieved value for %s from GCS path %s.", id, gcsPath)
+				cacheData.Value = string(gcsValueBytes)
+			}
+		}
+	}
+
+	if project.CacheDb {
+		// Marshal the potentially GCS-retrieved cacheData for local cache
+		dataForCache, err := json.Marshal(cacheData)
+		if err != nil {
+			log.Printf("[WARNING] GetDatastoreKey: Failed marshalling CacheKeyData for local cache: %s", err)
+		} else {
+			err = SetCache(ctx, cacheKey, dataForCache, 1440) // Use the already populated cacheKey
+			if err != nil {
+				log.Printf("[WARNING] GetDatastoreKey: Failed setting cache for get cache key '%s': %s", id, err)
+			}
 		}
 	}
 
